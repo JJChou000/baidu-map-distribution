@@ -31,6 +31,64 @@ GEOCODE_URL = "https://api.map.baidu.com/geocoding/v3/"
 STATIC_MAP_URL = "http://api.map.baidu.com/staticimage/v2/"
 DIRECTION_URL = "https://api.map.baidu.com/direction/v2/driving"
 
+# ============================================================
+# 全局限流器 — 所有百度API共享，防止叠加超限
+# ============================================================
+# 百度免费额度（日）：
+#   地理编码: ~6,000次/天   静态图: ~100,000次/天
+#   路线规划: ~30万次/月(~1万次/天)  地点检索: ~6,000次/天
+# 安全策略：全局统一限流 + 各API独立计数
+
+import threading
+
+class _BaiduRateLimiter:
+    """线程安全的全局限流器，所有百度API调用必须经过这里"""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_call_time = 0          # 上次任意API调用时间
+        self._min_interval = 0.35         # 全局最小间隔(秒) ≈ 2.8 QPS，远低于所有限额
+        # 各API独立计数器（用于日志和预警）
+        self._counts = {
+            "geocode": 0,
+            "direction": 0,
+            "static_map": 0,
+            "place_search": 0,
+        }
+        # 各API日限额预警阈值（达到此值开始放慢速度）
+        self._warnings = {
+            "geocode": 4000,
+            "direction": 7000,
+            "static_map": 80000,
+            "place_search": 4000,
+        }
+    
+    def wait(self, api_type="default"):
+        """调用前等待，确保不超并发。返回是否接近限额"""
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call_time
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_call_time = time.time()
+            self._counts[api_type] = self._counts.get(api_type, 0) + 1
+            
+            count = self._counts[api_type]
+            warn_at = self._warnings.get(api_type, float('inf'))
+            
+            # 接近限额时自动加大间隔
+            if count > warn_at * 0.8:
+                extra_sleep = min(0.5, (count / warn_at) * 0.3)
+                return True, extra_sleep  # 接近上限
+            
+            return False, 0
+    
+    def get_stats(self):
+        with self._lock:
+            return dict(self._counts)
+
+# 全局单例
+_rate_limiter = _BaiduRateLimiter()
+
 REQUEST_DELAY = 0.2      # seconds between batch geocoding requests
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 2, 3]
@@ -144,6 +202,10 @@ def api_geocode(address, ak, max_retries=MAX_RETRIES):
     Coordinates returned as (lng, lat) — standard order.
     Retries on 401/429/5xx.
     """
+    near_limit, extra = _rate_limiter.wait("geocode")
+    if extra:
+        time.sleep(extra)
+
     params = {"address": address, "output": "json", "ak": ak}
 
     for attempt in range(max_retries + 1):
@@ -181,6 +243,10 @@ def api_direction(origin_lat, origin_lng, dest_lat, dest_lng, ak,
     **IMPORTANT**: Coordinate order is (lat, lng) — NOT (lng, lat)!
     Returns (distance_m, duration_s) or (0, 0) on failure.
     """
+    near_limit, extra = _rate_limiter.wait("direction")
+    if extra:
+        time.sleep(extra)
+    
     for _ in range(MAX_RETRIES + 1):
         try:
             r = requests.get(DIRECTION_URL, params={
@@ -288,6 +354,7 @@ def calibrate_pixel_scale(center_lng, center_lat, zoom, w, h, ak):
     """
     url_clean = (f"{STATIC_MAP_URL}?ak={ak}"
                  f"&center={center_lng},{center_lat}&width={w}&height={h}&zoom={zoom}")
+    _rate_limiter.wait("static_map")
     img_a = np.array(Image.open(
         BytesIO_wrapper(requests.get(url_clean, timeout=20).content)).convert("RGB"))
 
@@ -316,6 +383,7 @@ def _calibrate_axis(img_clean, clng, clat, zoom, w, h, ak, axis="lng"):
     url_marker = (f"{STATIC_MAP_URL}?ak={ak}"
                   f"&center={clng},{clat}&width={w}&height={h}&zoom={zoom}"
                   f"&markers={param}")
+    _rate_limiter.wait("static_map")
     img_marker = np.array(Image.open(
         BytesIO(requests.get(url_marker, timeout=15).content)).convert("RGB"))
 

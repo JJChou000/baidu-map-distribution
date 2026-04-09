@@ -1,0 +1,33 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cache data (contains geocoding results, not secrets but large)
+.geocode_cache.json
+*.cache.json
+
+# Environment / secrets (NEVER commit)
+.env
+config.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Output artifacts
+*.png
+*.docx
+*.xlsx
+!examples/*
+
+# Python
+*.egg-info/
+dist/
+build/
